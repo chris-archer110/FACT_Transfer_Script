@@ -1,0 +1,6 @@
+# Python 3.9 or newer is required.
+# The program uses only Python standard-library modules; no pip packages are needed.
+#
+# macOS system dependency (install separately; this is not a Python package):
+#   brew install libcdio-paranoia
+# This provides the cd-paranoia executable required to rip audio CDs.

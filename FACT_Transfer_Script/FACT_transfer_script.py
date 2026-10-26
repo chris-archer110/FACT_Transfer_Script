@@ -6,6 +6,15 @@ def setup():
     Prompt the user for input and set up the configuration dictionary.
     """
     config = {}
+    while True:
+        config['rip_mode'] = ask(
+            "CD read mode (fast disables error verification/correction; quality keeps it enabled)",
+            "fast",
+        ).lower()
+        if config['rip_mode'] in {"fast", "quality"}:
+            break
+        print("Please enter 'fast' or 'quality'.")
+
     config['cd_device'] = ask("Enter the CD drive device path (leave blank to auto-detect): ")
     config['track_numbers'] = get_cd_track_numbers(config['cd_device'])
     config['num_tracks'] = len(config['track_numbers'])
@@ -23,7 +32,6 @@ def run():
     fact_entry = generate_new_fact_entry(config)
     print(f"GENERATED FACT ENTRY: {fact_entry}")
     staged_files = stage_cd_tracks(config)
-    print(f"RIPPED THE FOLLOWING TRACKS INTO {config['staging_dir'] + '/' + fact_entry}: {staged_files}")
     print(f"STAGING COMPLETE. Please verify the files in {config['staging_dir'] + '/' + fact_entry} are correct and label any dead tracks with '_DEAD' as a suffix.")
 
 run()

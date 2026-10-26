@@ -159,6 +159,10 @@ def generate_new_fact_entry(config):
 def stage_cd_tracks(config, overwrite: bool = False) -> list[Path]:
     """Rip audio tracks from the CD directly into a new FACT staging folder."""
     cd_device = config.get("cd_device", "")
+    rip_mode = config.get("rip_mode", "quality")
+    if rip_mode not in {"fast", "quality"}:
+        raise ValueError("Rip mode must be 'fast' or 'quality'.")
+
     track_numbers = config.get("track_numbers")
     if track_numbers is None:
         track_numbers = get_cd_track_numbers(cd_device)
@@ -177,8 +181,9 @@ def stage_cd_tracks(config, overwrite: bool = False) -> list[Path]:
             partial_output = FACT_dir / f".{destination.name}.partial"
 
             print(f"Ripping CD track {track_number} -> {destination}")
+            rip_options = ["-Z"] if rip_mode == "fast" else []
             _run_cdparanoia(
-                ["-w", str(track_number), str(partial_output)],
+                [*rip_options, "-w", str(track_number), str(partial_output)],
                 cd_device,
             )
             _validate_ripped_wav(partial_output)

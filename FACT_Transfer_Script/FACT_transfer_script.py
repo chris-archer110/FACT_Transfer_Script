@@ -22,8 +22,8 @@ def setup():
     config['staging_dir'] = FACT_STAGING_DIR
     config['backed_up_dir'] = FACT_BACKUP_DIR
     config['prev_fact_number'] = get_previous_FACT_number()
-    config['cd_call_number'] = ask("Enter the CD Call number (CDxxxx): ")
-    config['orig_call_number'] = ask("Enter the original Call number (XXyyyy): ")
+    config['cd_call_number'] = ask("Enter the CD Call number (CDxxxx)")
+    config['orig_call_number'] = ask("Enter the original Call number (XXyyyy)")
 
     return config
 
@@ -32,6 +32,6 @@ def run():
     fact_entry = generate_new_fact_entry(config)
     print(f"GENERATED FACT ENTRY: {fact_entry}")
     staged_files = stage_cd_tracks(config)
-    print(f"STAGING COMPLETE. Please verify the files in {config['staging_dir'] + '/' + fact_entry} are correct and label any dead tracks with '_DEAD' as a suffix.")
+    print(f"STAGING COMPLETE. After verification of tracks, run Synchronize_data.py")
 
 run()

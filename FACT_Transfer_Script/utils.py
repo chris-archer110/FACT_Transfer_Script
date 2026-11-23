@@ -50,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+from typing import Optional
 
 
 def ask(prompt: str, default: str = "") -> str:
@@ -201,3 +202,281 @@ def stage_cd_tracks(config, overwrite: bool = False) -> list[Path]:
 
     print(f"Ripped {len(staged_files)} track(s) into {FACT_dir}")
     return staged_files
+
+#UTILS FOR SYNCHRONIZE_DATA.PY
+
+def parse_fact_folder(folder: Path) -> tuple[str, str]:
+    match = re.fullmatch(r"FACT_(\d+)_.+_(CD\d+)", folder.name, re.IGNORECASE)
+    if match is None:
+        raise ValueError(
+            f"Folder name must match FACT_<number>_<original call #>_<CD call #>: {folder.name}"
+        )
+    return match.group(1), match.group(2)
+
+
+def resolve_staging_folder(folder_arg: Optional[str]) -> Path:
+    staging_dir = Path(FACT_STAGING_DIR).expanduser().resolve(strict=True)
+    if folder_arg:
+        folder = Path(folder_arg).expanduser().resolve(strict=True)
+    else:
+        candidates = sorted(
+            path for path in staging_dir.iterdir()
+            if path.is_dir() and re.fullmatch(
+                r"FACT_\d+_.+_(CD\d+)", path.name, re.IGNORECASE
+            )
+        )
+        if not candidates:
+            raise FileNotFoundError(f"No FACT folders found in {staging_dir}")
+        if len(candidates) == 1:
+            folder = candidates[0]
+        else:
+            print("FACT folders available to synchronize:")
+            for index, candidate in enumerate(candidates, start=1):
+                print(f"  {index}. {candidate.name}")
+            selection = input("Select a folder number: ").strip()
+            try:
+                folder = candidates[int(selection) - 1]
+            except (ValueError, IndexError) as exc:
+                raise ValueError("Select a valid folder number.") from exc
+
+    if folder.parent != staging_dir or not folder.is_dir():
+        raise ValueError(f"Choose a FACT folder directly inside {staging_dir}.")
+    if not any(
+        file.is_file() and file.suffix.lower() in AUDIO_EXTENSIONS
+        for file in folder.iterdir()
+    ):
+        raise ValueError(f"No audio tracks found in FACT folder: {folder}")
+    return folder
+
+
+def _google_services():
+    if not GOOGLE_SERVICE_ACCOUNT_FILE:
+        raise RuntimeError(
+            "Set GOOGLE_SERVICE_ACCOUNT_FILE in consts.py to the local "
+            "service-account credential file path."
+        )
+    credential_path = Path(GOOGLE_SERVICE_ACCOUNT_FILE).expanduser()
+    if not credential_path.is_file():
+        raise FileNotFoundError(
+            f"Google service-account credential file not found: {credential_path}"
+        )
+
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install Google API dependencies with "
+            "'python3 -m pip install -r requirements.txt'."
+        ) from exc
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    credentials = Credentials.from_service_account_file(
+        str(credential_path), scopes=scopes
+    )
+    return (
+        build("drive", "v3", credentials=credentials, cache_discovery=False),
+        build("sheets", "v4", credentials=credentials, cache_discovery=False),
+    )
+
+
+def _execute_google_request(request):
+    from googleapiclient.errors import HttpError
+
+    try:
+        return request.execute()
+    except HttpError as exc:
+        raise RuntimeError(f"Google API request failed: {exc}") from exc
+
+
+def _find_spreadsheet_id(drive_service, spreadsheet_link: str) -> str:
+    match = re.fullmatch(
+        r"https://docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)(?:[/?#].*)?",
+        spreadsheet_link.strip(),
+    )
+    if match is None:
+        raise RuntimeError(
+            "Provide a valid Google Sheets link (https://docs.google.com/"
+            "spreadsheets/d/<spreadsheet-id>); spreadsheet IDs, titles, and "
+            "file paths are not accepted."
+        )
+    return match.group(1)
+
+
+def _find_progress_sheet(sheets_service, spreadsheet_id: str):
+    """Find the unique sheet tab with Call_Number and FACT headers."""
+    metadata = sheets_service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+    )
+    metadata = _execute_google_request(metadata)
+
+    matching_tabs = []
+    for sheet in metadata.get("sheets", []):
+        properties = sheet["properties"]
+        title = properties["title"]
+        quoted_title = "'" + title.replace("'", "''") + "'"
+        header_response = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quoted_title}!A1:ZZ1",
+        )
+        header_response = _execute_google_request(header_response)
+        headers = header_response.get("values", [[]])[0]
+        first_header = headers[0] if headers else ""
+        if (
+            not first_header
+            and "Call_Number" in headers
+            and "FACT" in headers
+        ):
+            matching_tabs.append((properties, headers))
+
+    if len(matching_tabs) != 1:
+        raise RuntimeError(
+            "Expected exactly one sheet tab with Call_Number and FACT headers; "
+            f"found {len(matching_tabs)}."
+        )
+
+    properties, headers = matching_tabs[0]
+    quoted_title = "'" + properties["title"].replace("'", "''") + "'"
+    return properties, headers, quoted_title
+
+
+def _find_matching_row_number(
+    sheets_service,
+    spreadsheet_id: str,
+    quoted_title: str,
+    headers: list[str],
+    cd_call_number: str,
+) -> int:
+    """Return the unique row matching the requested Call_Number."""
+    call_column = headers.index("Call_Number")
+    values_response = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{quoted_title}!A2:ZZ2000",
+    )
+    values_response = _execute_google_request(values_response)
+    rows = values_response.get("values", [])
+
+    def normalize_call(value: object) -> str:
+        return "".join(str(value).upper().split())
+
+    matches = [
+        (row_index, row)
+        for row_index, row in enumerate(rows, start=2)
+        if len(row) > call_column
+        and normalize_call(row[call_column]) == normalize_call(cd_call_number)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected one spreadsheet row for {cd_call_number}; found {len(matches)}."
+        )
+    return matches[0][0]
+
+
+def _read_spreadsheet_row(
+    sheets_service,
+    spreadsheet_id: str,
+    quoted_title: str,
+    row_number: int,
+    cd_call_number: str,
+) -> list[dict]:
+    """Read the selected row's entered values for a preserving update."""
+    row_response = sheets_service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        ranges=[f"{quoted_title}!A{row_number}:ZZ{row_number}"],
+        includeGridData=True,
+        fields="sheets(data(rowData(values(userEnteredValue))))",
+    )
+    row_response = _execute_google_request(row_response)
+    sheet_data = row_response.get("sheets", [])
+    grid_data = sheet_data[0].get("data", []) if sheet_data else []
+    row_data = grid_data[0].get("rowData", []) if grid_data else []
+    if not row_data:
+        raise RuntimeError(
+            f"Could not read spreadsheet row {row_number} for {cd_call_number}."
+        )
+
+    return [
+        {"userEnteredValue": dict(cell["userEnteredValue"])}
+        if "userEnteredValue" in cell
+        else {}
+        for cell in row_data[0].get("values", [])
+    ]
+
+
+def _build_row_update(
+    row_values: list[dict],
+    headers: list[str],
+    sheet_id: int,
+    row_number: int,
+    fact_entry: str,
+) -> dict:
+    """Build a full-row update preserving values except FACT and completion."""
+    fact_column = headers.index("FACT")
+    row_width = max(len(headers), len(row_values), fact_column + 1, 1)
+    row_values.extend({} for _ in range(row_width - len(row_values)))
+    row_values[0] = {"userEnteredValue": {"boolValue": True}}
+    row_values[fact_column] = {
+        "userEnteredValue": {"stringValue": fact_entry}
+    }
+
+    return {
+        "updateCells": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": row_number - 1,
+                "endRowIndex": row_number,
+                "startColumnIndex": 0,
+                "endColumnIndex": row_width,
+            },
+            "rows": [{"values": row_values}],
+            "fields": "userEnteredValue",
+        }
+    }
+
+
+def _write_spreadsheet_row(
+    sheets_service,
+    spreadsheet_id: str,
+    row_update: dict,
+) -> None:
+    """Submit the row replacement to Google Sheets."""
+    request = sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [row_update]},
+    )
+    _execute_google_request(request)
+
+
+def update_google_sheet(
+    cd_call_number: str,
+    fact_entry: str,
+    spreadsheet_link: str = "",
+) -> None:
+    """Update FACT and completion on the unique matching spreadsheet row."""
+    drive_service, sheets_service = _google_services()
+    spreadsheet_id = _find_spreadsheet_id(drive_service, spreadsheet_link)
+    properties, headers, quoted_title = _find_progress_sheet(
+        sheets_service, spreadsheet_id
+    )
+    row_number = _find_matching_row_number(
+        sheets_service, spreadsheet_id, quoted_title, headers, cd_call_number
+    )
+    row_values = _read_spreadsheet_row(
+        sheets_service,
+        spreadsheet_id,
+        quoted_title,
+        row_number,
+        cd_call_number,
+    )
+    row_update = _build_row_update(
+        row_values, headers, properties["sheetId"], row_number, fact_entry
+    )
+    _write_spreadsheet_row(sheets_service, spreadsheet_id, row_update)
+    print(
+        f"Checked the completion box and set FACT={fact_entry} "
+        f"for {cd_call_number}."
+    )

@@ -1,5 +1,8 @@
 # Python 3.9 or newer is required.
-# The program uses only Python standard-library modules; no pip packages are needed.
+# Google Sheets synchronization dependencies:
+google-api-python-client>=2.0
+google-auth>=2.0
+google-cloud-iam>=1.0
 #
 # macOS system dependency (install separately; this is not a Python package):
 #   brew install libcdio-paranoia
